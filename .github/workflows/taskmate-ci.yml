@@ -2,7 +2,7 @@
 # TaskMate lo reemplaza la próxima vez que alguien configure el pipeline.
 # taskmate-pipeline: 2
 name: 'TaskMate CI/CD'
-run-name: ${{ inputs.environment && inputs.environment != 'none' && format('Deploy a {0} desde TaskMate', inputs.environment) || '' }}
+run-name: ${{ inputs.environment == 'production' && 'Deploy a producción desde TaskMate' || inputs.environment == 'staging' && 'Deploy a staging desde TaskMate' || '' }}
 
 on:
   push:
