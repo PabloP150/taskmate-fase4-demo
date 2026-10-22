@@ -5,7 +5,8 @@ const tasks = [
   { name: 'Configurar el pipeline desde TaskMate', done: true },
   { name: 'Pasar el CI (lint, pruebas y build)', done: true },
   { name: 'Desplegar a staging', done: true },
-  { name: 'Promover a producción', done: false },
+  { name: 'Promover a producción', done: true },
+  { name: 'Probar el rollback desde TaskMate', done: false },
 ];
 
 document.querySelector('#summary').textContent = summary(tasks);
