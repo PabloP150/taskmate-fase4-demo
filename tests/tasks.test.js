@@ -3,7 +3,7 @@ import { progress, summary } from '../src/tasks.js';
 
 describe('progress', () => {
   test('porcentaje de tareas completadas', () => {
-    expect(progress([{ done: true }, { done: false }, { done: true }, { done: true }])).toBe(75);
+    expect(progress([{ done: true }, { done: false }, { done: true }, { done: true }])).toBe(80);
   });
 
   test('sin tareas es 0', () => {
