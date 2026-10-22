@@ -1,6 +1,6 @@
 # Generado por TaskMate (GitHub → CI/CD). Cámbialo desde TaskMate: si lo editas a mano,
 # TaskMate lo reemplaza la próxima vez que alguien configure el pipeline.
-# taskmate-pipeline: 1
+# taskmate-pipeline: 2
 name: 'TaskMate CI/CD'
 run-name: ${{ inputs.environment && inputs.environment != 'none' && format('Deploy a {0} desde TaskMate', inputs.environment) || '' }}
 
@@ -27,6 +27,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: >-
+    ${{ github.ref_name == github.event.repository.default_branch && (github.event_name == 'push' ||
+    (github.event_name == 'workflow_dispatch' && inputs.environment != 'none'))
+    && 'taskmate-pages' || format('taskmate-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   ci:
     name: 'CI (Node.js)'
@@ -34,8 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      group: taskmate-ci-${{ github.ref }}
-      cancel-in-progress: true
+      group: taskmate-ci-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch }}
     steps:
       - name: 'Checkout'
         uses: actions/checkout@v7
@@ -48,19 +56,19 @@ jobs:
           cache: npm
           cache-dependency-path: 'package-lock.json'
       - name: 'Instalar dependencias'
-        run: npm ci
+        run: 'npm ci'
       - name: 'Análisis estático'
-        run: npm run lint
+        run: 'npm run lint'
       - name: 'Pruebas'
-        run: npm test
+        run: 'npm test'
       - name: 'Build'
-        run: npm run build
+        run: 'npm run build'
 
-  deploy:
-    name: 'Deploy a GitHub Pages'
+  build:
+    name: 'Build del deploy'
     needs: ci
     if: >-
-      always() && github.ref_name == github.event.repository.default_branch && (
+      !cancelled() && github.ref_name == github.event.repository.default_branch && (
         (github.event_name == 'push' && needs.ci.result == 'success') ||
         (github.event_name == 'workflow_dispatch' && inputs.environment != 'none')
       )
@@ -70,14 +78,12 @@ jobs:
       actions: read
       contents: read
       deployments: write
-      id-token: write
-      pages: write
-    concurrency:
-      group: taskmate-pages
-      cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.publish.outputs.page_url }}
+      pages: read
+    outputs:
+      skip: ${{ steps.versions.outputs.skip }}
+      target: ${{ steps.versions.outputs.target }}
+      deployment_id: ${{ steps.versions.outputs.deployment_id }}
+      attempt: ${{ github.run_attempt }}
     steps:
       - name: 'Versiones a publicar'
         id: versions
@@ -85,104 +91,240 @@ jobs:
         with:
           script: |
             const SHA = /^[0-9a-f]{40}$/;
+            const TASK = 'deploy:taskmate';
             const target = process.env.TARGET_ENV;
             const version = process.env.TARGET_VERSION;
             const requestedBy = String(process.env.REQUESTED_BY || '').replace(/[^A-Za-z0-9_.@ -]/g, '').slice(0, 60);
             if (!['staging', 'production'].includes(target)) throw new Error('Entorno inválido: ' + target);
             if (!SHA.test(version)) throw new Error('Versión inválida (se espera el SHA completo del commit): ' + version);
             const { owner, repo } = context.repo;
-            const live = async (environment) => {
-              const { data } = await github.rest.repos.listDeployments({ owner, repo, environment, task: 'deploy:taskmate', per_page: 30 });
-              for (const deployment of data) {
-                const { data: statuses } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: deployment.id, per_page: 1 });
-                if (statuses.length > 0 && statuses[0].state === 'success') return deployment.sha;
+            core.setOutput('skip', 'false');
+            if (context.eventName === 'push') {
+              const branch = context.payload.repository.default_branch;
+              const { data: head } = await github.rest.git.getRef({ owner, repo, ref: 'heads/' + branch });
+              if (head.object.sha !== version) {
+                core.notice('No se despliega ' + version.slice(0, 7) + ': ya no es la última versión de ' + branch + '.');
+                core.setOutput('skip', 'true');
+                return;
               }
-              return '';
+            }
+            const succeeded = async (deployment) => {
+              const { data } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: deployment.id, per_page: 1 });
+              return data.length > 0 && data[0].state === 'success';
             };
+            const runIdOf = (deployment) => {
+              let payload = deployment.payload;
+              for (let i = 0; i < 3 && typeof payload === 'string'; i += 1) {
+                try {
+                  payload = JSON.parse(payload);
+                } catch (err) {
+                  return '';
+                }
+              }
+              const runId = payload && typeof payload === 'object' ? Number(payload.runId) : 0;
+              return Number.isSafeInteger(runId) && runId > 0 ? String(runId) : '';
+            };
+            let baseRun = '';
+            const { data: recent } = await github.rest.repos.listDeployments({ owner, repo, task: TASK, per_page: 30 });
+            for (const deployment of recent) {
+              if (['staging', 'production'].includes(deployment.environment) && await succeeded(deployment)) {
+                baseRun = runIdOf(deployment);
+                break;
+              }
+            }
             const other = target === 'staging' ? 'production' : 'staging';
-            const versions = { [target]: version, [other]: await live(other) };
+            let otherVersion = '';
+            const { data: otherDeploys } = await github.rest.repos.listDeployments({ owner, repo, environment: other, task: TASK, per_page: 30 });
+            for (const deployment of otherDeploys) {
+              if (SHA.test(deployment.sha) && await succeeded(deployment)) {
+                otherVersion = deployment.sha;
+                break;
+              }
+            }
+            const pathOf = (environment) => (environment === 'staging' ? '/staging/' : '/');
+            core.setOutput('target', target);
+            core.setOutput('target_version', version);
+            core.setOutput('target_path', pathOf(target));
+            core.setOutput('other_version', otherVersion);
+            core.setOutput('other_path', pathOf(other));
+            core.setOutput('base_run', baseRun);
             const logUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
             const { data: deployment } = await github.rest.repos.createDeployment({
-              owner, repo, ref: version, task: 'deploy:taskmate', environment: target,
+              owner, repo, ref: version, task: TASK, environment: target,
               auto_merge: false, required_contexts: [], production_environment: target === 'production', transient_environment: false,
               description: requestedBy ? 'Desde TaskMate, pedido por ' + requestedBy : 'Desde TaskMate',
               payload: { taskmate: true, requestedBy, runId: context.runId },
             });
-            await github.rest.repos.createDeploymentStatus({ owner, repo, deployment_id: deployment.id, state: 'in_progress', log_url: logUrl });
-            core.setOutput('production', versions.production);
-            core.setOutput('staging', versions.staging);
+            if (!deployment.id) throw new Error('GitHub no creó el deployment: ' + (deployment.message || ''));
+            // Right away, so the failure step can close this deployment whatever fails next.
             core.setOutput('deployment_id', String(deployment.id));
+            await github.rest.repos.createDeploymentStatus({ owner, repo, deployment_id: deployment.id, state: 'in_progress', log_url: logUrl });
         env:
           TARGET_ENV: ${{ github.event_name == 'push' && 'staging' || inputs.environment }}
           TARGET_VERSION: ${{ github.event_name == 'push' && github.sha || inputs.version }}
           REQUESTED_BY: ${{ inputs.requested_by }}
       - name: 'Configurar GitHub Pages'
         id: pages
+        if: steps.versions.outputs.skip != 'true'
         uses: actions/configure-pages@v6
       - name: 'Node.js 24'
+        if: steps.versions.outputs.skip != 'true'
         uses: actions/setup-node@v7
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: 'Checkout de producción'
-        if: steps.versions.outputs.production != ''
+      - name: 'Descargar el sitio publicado'
+        id: previous
+        if: steps.versions.outputs.skip != 'true' && steps.versions.outputs.base_run != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: github-pages
+          run-id: ${{ steps.versions.outputs.base_run }}
+          github-token: ${{ github.token }}
+          path: '_taskmate/previous'
+      - name: 'Checkout de la versión a desplegar'
+        id: target_checkout
+        if: steps.versions.outputs.skip != 'true'
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.versions.outputs.production }}
-          path: '_taskmate/production'
+          ref: ${{ steps.versions.outputs.target_version }}
+          path: '_taskmate/target'
           persist-credentials: false
-      - name: 'Build de producción'
-        if: steps.versions.outputs.production != ''
-        working-directory: '_taskmate/production'
+      - name: 'Build de la versión a desplegar'
+        id: target_build
+        if: steps.target_checkout.outcome == 'success'
+        working-directory: '_taskmate/target'
         env:
-          BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}${{ steps.versions.outputs.target_path }}
         run: |
           npm ci
           npm run build -- --base="$BASE_PATH"
-      - name: 'Checkout de staging'
-        if: steps.versions.outputs.staging != ''
+      - name: 'Checkout del otro entorno (respaldo)'
+        id: other_checkout
+        if: steps.versions.outputs.skip != 'true' && steps.versions.outputs.other_version != '' && (steps.previous.outcome != 'success' || hashFiles('_taskmate/previous/artifact.tar') == '')
+        continue-on-error: true
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.versions.outputs.staging }}
-          path: '_taskmate/staging'
+          ref: ${{ steps.versions.outputs.other_version }}
+          path: '_taskmate/other'
           persist-credentials: false
-      - name: 'Build de staging'
-        if: steps.versions.outputs.staging != ''
-        working-directory: '_taskmate/staging'
+      - name: 'Build del otro entorno (respaldo)'
+        id: other_build
+        if: steps.other_checkout.outcome == 'success'
+        continue-on-error: true
+        working-directory: '_taskmate/other'
         env:
-          BASE_PATH: ${{ steps.pages.outputs.base_path }}/staging/
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}${{ steps.versions.outputs.other_path }}
         run: |
           npm ci
           npm run build -- --base="$BASE_PATH"
       - name: 'Armar el sitio (producción en /, staging en /staging/)'
+        if: steps.versions.outputs.skip != 'true'
         env:
-          PRODUCTION: ${{ steps.versions.outputs.production }}
-          STAGING: ${{ steps.versions.outputs.staging }}
+          TARGET_ENV: ${{ steps.versions.outputs.target }}
+          OTHER_VERSION: ${{ steps.versions.outputs.other_version }}
+          PREVIOUS: ${{ steps.previous.outcome }}
+          OTHER_BUILT: ${{ steps.other_build.outcome }}
         run: |
           set -euo pipefail
           copy_site() {
-            if [ ! -d "$1" ]; then echo "::error::No se encontró la carpeta del sitio: $1"; exit 1; fi
-            mkdir -p "$2"
-            tar --exclude=./.git --exclude=./.github -C "$1" -cf - . | tar -C "$2" -xf -
+            local from="$1" to="$2"
+            shift 2
+            if [ ! -d "$from" ]; then echo "::error::No se encontró la carpeta del sitio: $from"; return 1; fi
+            mkdir -p "$to"
+            tar --exclude=./.git --exclude=./.github "$@" -C "$from" -cf - . | tar -C "$to" -xf -
           }
+          copy_env() {
+            if [ "$2" = production ]; then copy_site "$1" _site --exclude=./staging; else copy_site "$1" _site/staging; fi
+          }
+          clear_env() {
+            if [ "$1" = production ]; then find _site -mindepth 1 -maxdepth 1 ! -name staging -exec rm -rf {} +; else rm -rf _site/staging; fi
+          }
+          if [ "$TARGET_ENV" = production ]; then OTHER_ENV=staging; else OTHER_ENV=production; fi
+          rm -rf _site
           mkdir -p _site
-          if [ -n "$PRODUCTION" ]; then
-            copy_site '_taskmate/production/dist' _site
-          else
+          if [ "$PREVIOUS" = success ] && [ -f '_taskmate/previous/artifact.tar' ]; then
+            tar -C _site -xf '_taskmate/previous/artifact.tar'
+          elif [ -n "$OTHER_VERSION" ]; then
+            if [ "$OTHER_BUILT" = success ] && copy_env '_taskmate/other/dist' "$OTHER_ENV"; then
+              echo "No se pudo descargar el sitio publicado: se reconstruyó $OTHER_ENV desde ${OTHER_VERSION:0:7}."
+            else
+              echo "::warning::No se pudo reconstruir $OTHER_ENV (${OTHER_VERSION:0:7}): queda una página provisional hasta su próximo deploy."
+              clear_env "$OTHER_ENV"
+              if [ "$OTHER_ENV" = production ]; then
+                printf '%s\n' '<!doctype html>' '<html lang="es"><head><meta charset="utf-8"><title>Producción no disponible</title></head>' '<body><p>TaskMate no pudo reconstruir la versión publicada de producción. Vuelve a desplegarla desde TaskMate.</p>' '<p><a href="staging/">Ver staging</a></p></body></html>' > _site/index.html
+              else
+                mkdir -p _site/staging
+                printf '%s\n' '<!doctype html>' '<html lang="es"><head><meta charset="utf-8"><title>Staging no disponible</title></head>' '<body><p>TaskMate no pudo reconstruir la versión publicada de staging; vuelve con el próximo deploy a staging.</p></body></html>' > _site/staging/index.html
+              fi
+            fi
+          elif [ "$TARGET_ENV" = staging ]; then
             printf '%s\n' '<!doctype html>' '<html lang="es"><head><meta charset="utf-8"><title>Sin versión en producción</title></head>' '<body><p>Producción todavía no tiene una versión publicada desde TaskMate.</p>' '<p><a href="staging/">Ver staging</a></p></body></html>' > _site/index.html
           fi
-          rm -rf _site/staging
-          if [ -n "$STAGING" ]; then
-            copy_site '_taskmate/staging/dist' _site/staging
-          fi
+          clear_env "$TARGET_ENV"
+          copy_env '_taskmate/target/dist' "$TARGET_ENV"
       - name: 'Subir el sitio'
+        if: steps.versions.outputs.skip != 'true'
         uses: actions/upload-pages-artifact@v5
         with:
           path: _site
+          retention-days: 90
+      - name: 'Registrar el deploy fallido'
+        if: (failure() || cancelled()) && steps.versions.outputs.deployment_id != ''
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const deploymentId = Number(process.env.DEPLOYMENT_ID);
+            const { data: statuses } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: deploymentId, per_page: 1 });
+            const last = statuses.length > 0 ? statuses[0].state : '';
+            if (['success', 'failure', 'error', 'inactive'].includes(last)) {
+              core.info('El deploy ya quedó registrado como ' + last + '.');
+              return;
+            }
+            const logUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
+            await github.rest.repos.createDeploymentStatus({
+              owner, repo, deployment_id: deploymentId, state: 'failure', log_url: logUrl,
+            });
+        env:
+          DEPLOYMENT_ID: ${{ steps.versions.outputs.deployment_id }}
+
+  deploy:
+    name: 'Deploy a GitHub Pages'
+    needs: build
+    if: >-
+      !cancelled() && needs.build.result == 'success' && needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      deployments: write
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: 'Comprobar que el build es de este intento'
+        id: current
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const built = String(process.env.BUILD_ATTEMPT || '');
+            const attempt = String(process.env.RUN_ATTEMPT || '');
+            if (built !== attempt) {
+              core.setFailed('No se vuelve a ejecutar solo el deploy: publicaría el sitio que armó el intento ' + (built || '?')
+                + ' de esta ejecución, que puede estar desactualizado. Vuelve a desplegar desde TaskMate (o vuelve a ejecutar todos los jobs).');
+            }
+        env:
+          BUILD_ATTEMPT: ${{ needs.build.outputs.attempt }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
       - name: 'Publicar en GitHub Pages'
         id: publish
         uses: actions/deploy-pages@v5
       - name: 'Registrar el deploy'
+        if: steps.current.outcome == 'success'
         uses: actions/github-script@v9
         with:
           script: |
@@ -195,18 +337,55 @@ jobs:
               environment_url: url, log_url: logUrl, auto_inactive: true,
             });
         env:
-          DEPLOYMENT_ID: ${{ steps.versions.outputs.deployment_id }}
-          TARGET_ENV: ${{ github.event_name == 'push' && 'staging' || inputs.environment }}
+          DEPLOYMENT_ID: ${{ needs.build.outputs.deployment_id }}
+          TARGET_ENV: ${{ needs.build.outputs.target }}
           PAGE_URL: ${{ steps.publish.outputs.page_url }}
       - name: 'Registrar el deploy fallido'
-        if: (failure() || cancelled()) && steps.versions.outputs.deployment_id != ''
+        if: (failure() || cancelled()) && needs.build.outputs.deployment_id != '' && steps.current.outcome == 'success'
         uses: actions/github-script@v9
         with:
           script: |
             const { owner, repo } = context.repo;
+            const deploymentId = Number(process.env.DEPLOYMENT_ID);
+            const { data: statuses } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: deploymentId, per_page: 1 });
+            const last = statuses.length > 0 ? statuses[0].state : '';
+            if (['success', 'failure', 'error', 'inactive'].includes(last)) {
+              core.info('El deploy ya quedó registrado como ' + last + '.');
+              return;
+            }
             const logUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
             await github.rest.repos.createDeploymentStatus({
-              owner, repo, deployment_id: Number(process.env.DEPLOYMENT_ID), state: 'failure', log_url: logUrl,
+              owner, repo, deployment_id: deploymentId, state: 'failure', log_url: logUrl,
             });
         env:
-          DEPLOYMENT_ID: ${{ steps.versions.outputs.deployment_id }}
+          DEPLOYMENT_ID: ${{ needs.build.outputs.deployment_id }}
+
+  close:
+    name: 'Cerrar el deploy'
+    needs: [build, deploy]
+    if: >-
+      always() && needs.build.outputs.deployment_id != '' && needs.build.outputs.attempt == github.run_attempt
+      && needs.deploy.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      deployments: write
+    steps:
+      - name: 'Registrar el deploy fallido'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const deploymentId = Number(process.env.DEPLOYMENT_ID);
+            const { data: statuses } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: deploymentId, per_page: 1 });
+            const last = statuses.length > 0 ? statuses[0].state : '';
+            if (['success', 'failure', 'error', 'inactive'].includes(last)) {
+              core.info('El deploy ya quedó registrado como ' + last + '.');
+              return;
+            }
+            const logUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
+            await github.rest.repos.createDeploymentStatus({
+              owner, repo, deployment_id: deploymentId, state: 'failure', log_url: logUrl,
+            });
+        env:
+          DEPLOYMENT_ID: ${{ needs.build.outputs.deployment_id }}
