@@ -132,6 +132,17 @@ jobs:
                 break;
               }
             }
+            if (baseRun) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: Number(baseRun), name: 'github-pages', per_page: 10 });
+                if (!data.artifacts.some((artifact) => !artifact.expired)) {
+                  core.info('El sitio publicado por la ejecución ' + baseRun + ' ya no está guardado en GitHub: se reconstruye el otro entorno.');
+                  baseRun = '';
+                }
+              } catch (err) {
+                core.info('No se pudo comprobar el sitio publicado (' + err.message + '): se intenta descargar igual.');
+              }
+            }
             const other = target === 'staging' ? 'production' : 'staging';
             let otherVersion = '';
             const { data: otherDeploys } = await github.rest.repos.listDeployments({ owner, repo, environment: other, task: TASK, per_page: 30 });
